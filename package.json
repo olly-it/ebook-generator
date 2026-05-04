@@ -1,0 +1,11 @@
+{
+  "name": "ebook-generator",
+  "private": true,
+  "scripts": {
+    "setup": "cd backend && npm install && cd ../frontend && npm install && cd ../python && python3 -m venv venv && venv/bin/pip install -r requirements.txt",
+    "migrate": "cd backend && node src/db/migrate.js",
+    "backend": "cd backend && npm run dev",
+    "frontend": "cd frontend && npm run dev",
+    "dev": "npm run backend & npm run frontend"
+  }
+}

@@ -1,0 +1,279 @@
+const express = require('express');
+const router = express.Router({ mergeParams: true });
+const path = require('path');
+const db = require('../db/client');
+const { cropWithCorners, rotateInPlace, splitImage } = require('../services/imageProcessor');
+
+const STORAGE = () => path.resolve(process.env.STORAGE_PATH);
+
+// GET /api/books/:bookId/pages
+router.get('/', async (req, res) => {
+  const { rows } = await db.query(
+    'SELECT * FROM pages WHERE book_id = $1 ORDER BY position',
+    [req.params.bookId]
+  );
+  res.json(rows);
+});
+
+// GET /api/books/:bookId/pages/by-ids?ids=id1,id2,...
+router.get('/by-ids', async (req, res) => {
+  const ids = (req.query.ids || '').split(',').filter(Boolean);
+  if (!ids.length) return res.json([]);
+  const placeholders = ids.map((_, i) => `$${i + 2}`).join(',');
+  const { rows } = await db.query(
+    `SELECT * FROM pages WHERE book_id = $1 AND id IN (${placeholders}) ORDER BY position`,
+    [req.params.bookId, ...ids]
+  );
+  res.json(rows);
+});
+
+// PATCH /api/books/:bookId/pages/reorder
+router.patch('/reorder', async (req, res) => {
+  const updates = req.body;
+  if (!Array.isArray(updates)) return res.status(400).json({ error: 'Expected array' });
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    for (const { id, position } of updates) {
+      await client.query(
+        'UPDATE pages SET position = $1 WHERE id = $2 AND book_id = $3',
+        [position, id, req.params.bookId]
+      );
+    }
+    await client.query('COMMIT');
+    res.status(204).end();
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/books/:bookId/pages/:pageId/rotate
+// Body: { degrees: 90 | -90 | 180 }
+router.post('/:pageId/rotate', async (req, res) => {
+  const { degrees } = req.body;
+  if (![90, -90, 180, 270].includes(degrees)) {
+    return res.status(400).json({ error: 'degrees must be 90, -90, 180, or 270' });
+  }
+
+  const { rows } = await db.query(
+    'SELECT * FROM pages WHERE id = $1 AND book_id = $2',
+    [req.params.pageId, req.params.bookId]
+  );
+  if (!rows.length) return res.status(404).json({ error: 'Page not found' });
+
+  const page = rows[0];
+  const processedAbs = path.join(STORAGE(), page.processed_file);
+  const result = await rotateInPlace(processedAbs, degrees);
+
+  const meta = { ...(page.processing_meta || {}), rotation: (page.processing_meta?.rotation || 0) + degrees };
+  await db.query(
+    'UPDATE pages SET width_px = $1, height_px = $2, processing_meta = $3 WHERE id = $4',
+    [result.width, result.height, JSON.stringify(meta), page.id]
+  );
+
+  const { rows: updated } = await db.query('SELECT * FROM pages WHERE id = $1', [page.id]);
+  res.json(updated[0]);
+});
+
+// POST /api/books/:bookId/pages/:pageId/recrop
+// Body: { corners: [[x,y],[x,y],[x,y],[x,y]], rotation?: number }
+// Re-processes the page with new corners from the source image
+router.post('/:pageId/recrop', async (req, res) => {
+  const { corners, rotation = 0 } = req.body;
+  if (!Array.isArray(corners) || corners.length !== 4) {
+    return res.status(400).json({ error: 'corners must be array of 4 [x,y] pairs' });
+  }
+
+  const { rows } = await db.query(
+    'SELECT * FROM pages WHERE id = $1 AND book_id = $2',
+    [req.params.pageId, req.params.bookId]
+  );
+  if (!rows.length) return res.status(404).json({ error: 'Page not found' });
+
+  const page = rows[0];
+  const storage = STORAGE();
+  const sourceAbs = path.join(storage, page.source_image || page.source_file);
+  const outDir = path.join(storage, 'processed', req.params.bookId);
+
+  const pages = await cropWithCorners(sourceAbs, corners, rotation, outDir);
+  if (!pages.length) return res.status(500).json({ error: 'Processing returned no pages' });
+
+  const newPage = pages[0];
+  const processedRel = path.relative(storage, path.join(outDir, newPage.filename));
+
+  await db.query(
+    `UPDATE pages SET processed_file = $1, width_px = $2, height_px = $3, processing_meta = $4 WHERE id = $5`,
+    [processedRel, newPage.width, newPage.height,
+     JSON.stringify({ ...newPage.processing_meta, method: 'manual_recrop' }), page.id]
+  );
+
+  const { rows: updated } = await db.query('SELECT * FROM pages WHERE id = $1', [page.id]);
+  res.json(updated[0]);
+});
+
+// POST /api/books/:bookId/pages/edit
+// Body: { source_image, parts: [{corners, rotation}], replace_ids? }
+// Re-processes N parts from the source image (perspective crop + rotation each),
+// replaces replace_ids pages with the new results.
+router.post('/edit', async (req, res) => {
+  const { source_image, parts, replace_ids = [] } = req.body;
+  if (!source_image || !Array.isArray(parts) || parts.length === 0) {
+    return res.status(400).json({ error: 'source_image and parts[] required' });
+  }
+
+  const storage = STORAGE();
+  const sourceAbs = path.join(storage, source_image);
+  const outDir = path.join(storage, 'processed', req.params.bookId);
+
+  // Determine insert position and delete replaced pages
+  let insertPos = 1;
+  if (replace_ids.length) {
+    const ph = replace_ids.map((_, i) => `$${i + 2}`).join(',');
+    const { rows } = await db.query(
+      `SELECT COALESCE(MIN(position), 1) AS min_pos FROM pages WHERE id IN (${ph}) AND book_id = $1`,
+      [req.params.bookId, ...replace_ids]
+    );
+    insertPos = parseFloat(rows[0].min_pos);
+    await db.query(
+      `DELETE FROM pages WHERE id IN (${ph}) AND book_id = $1`,
+      [req.params.bookId, ...replace_ids]
+    );
+  } else {
+    const { rows } = await db.query(
+      'SELECT COALESCE(MAX(position), 0) AS max_pos FROM pages WHERE book_id = $1',
+      [req.params.bookId]
+    );
+    insertPos = parseFloat(rows[0].max_pos) + 1;
+  }
+
+  const inserted = [];
+  for (let i = 0; i < parts.length; i++) {
+    const { corners, rotation = 0 } = parts[i];
+    const result = await cropWithCorners(sourceAbs, corners, rotation, outDir);
+    if (!result.length) continue;
+    const p = result[0];
+    const rel = path.relative(storage, path.join(outDir, p.filename));
+    const { rows } = await db.query(
+      `INSERT INTO pages (book_id, position, source_file, source_image, processed_file, width_px, height_px, processing_meta)
+       VALUES ($1, $2, $3, $3, $4, $5, $6, $7) RETURNING *`,
+      [req.params.bookId, insertPos + i * 0.01, source_image, rel,
+       p.width, p.height, JSON.stringify({ ...p.processing_meta, method: 'manual_crop' })]
+    );
+    inserted.push(rows[0]);
+  }
+
+  res.status(201).json(inserted);
+});
+
+// POST /api/books/:bookId/pages/split
+// Body: { source_image, direction, split_at, rotate_a, rotate_b, replace_ids? }
+// Splits source image at split_at (0–1), replaces replace_ids pages with 2 new ones.
+router.post('/split', async (req, res) => {
+  const { source_image, direction, split_at = 0.5, rotate_a = 0, rotate_b = 0, replace_ids = [] } = req.body;
+  if (!source_image || !['horizontal', 'vertical'].includes(direction)) {
+    return res.status(400).json({ error: 'source_image and direction (horizontal|vertical) required' });
+  }
+
+  const storage = STORAGE();
+  const sourceAbs = path.join(storage, source_image);
+  const outDir = path.join(storage, 'processed', req.params.bookId);
+
+  const parts = await splitImage(sourceAbs, direction, split_at, rotate_a, rotate_b, outDir);
+  if (!parts.length) return res.status(500).json({ error: 'Split produced no pages' });
+
+  // Determine insert position and delete replaced pages
+  let insertPos = 1;
+  if (replace_ids.length) {
+    const ph = replace_ids.map((_, i) => `$${i + 2}`).join(',');
+    const { rows: minRow } = await db.query(
+      `SELECT COALESCE(MIN(position), 1) AS min_pos FROM pages WHERE id IN (${ph}) AND book_id = $1`,
+      [req.params.bookId, ...replace_ids]
+    );
+    insertPos = parseFloat(minRow[0].min_pos);
+    await db.query(
+      `DELETE FROM pages WHERE id IN (${ph}) AND book_id = $1`,
+      [req.params.bookId, ...replace_ids]
+    );
+  } else {
+    const { rows } = await db.query(
+      'SELECT COALESCE(MAX(position), 0) AS max_pos FROM pages WHERE book_id = $1',
+      [req.params.bookId]
+    );
+    insertPos = parseFloat(rows[0].max_pos) + 1;
+  }
+
+  const inserted = [];
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    const processedRel = path.relative(storage, path.join(outDir, p.filename));
+    const { rows } = await db.query(
+      `INSERT INTO pages (book_id, position, source_file, source_image, processed_file, width_px, height_px, processing_meta)
+       VALUES ($1, $2, $3, $3, $4, $5, $6, $7) RETURNING *`,
+      [req.params.bookId, insertPos + i * 0.01, source_image, processedRel,
+       p.width, p.height, JSON.stringify(p.processing_meta)]
+    );
+    inserted.push(rows[0]);
+  }
+
+  res.status(201).json(inserted);
+});
+
+// POST /api/books/:bookId/pages/manual-crop
+// Body: { source_image, corners, rotation?, position? }
+// Creates a brand-new page from a manual crop of any source image
+router.post('/manual-crop', async (req, res) => {
+  const { source_image, corners, rotation = 0, position } = req.body;
+  if (!source_image || !Array.isArray(corners) || corners.length !== 4) {
+    return res.status(400).json({ error: 'source_image and 4 corners required' });
+  }
+
+  const storage = STORAGE();
+  const sourceAbs = path.join(storage, source_image);
+  const outDir = path.join(storage, 'processed', req.params.bookId);
+
+  const pages = await cropWithCorners(sourceAbs, corners, rotation, outDir);
+  if (!pages.length) return res.status(500).json({ error: 'Processing returned no pages' });
+
+  const newPage = pages[0];
+  const processedRel = path.relative(storage, path.join(outDir, newPage.filename));
+
+  // Determine position
+  let pos = position;
+  if (!pos) {
+    const { rows } = await db.query(
+      'SELECT COALESCE(MAX(position), 0) AS max_pos FROM pages WHERE book_id = $1',
+      [req.params.bookId]
+    );
+    pos = parseFloat(rows[0].max_pos) + 1;
+  }
+
+  const { rows: inserted } = await db.query(
+    `INSERT INTO pages (book_id, position, source_file, source_image, processed_file, width_px, height_px, processing_meta)
+     VALUES ($1, $2, $3, $3, $4, $5, $6, $7) RETURNING *`,
+    [req.params.bookId, pos, source_image, processedRel,
+     newPage.width, newPage.height,
+     JSON.stringify({ ...newPage.processing_meta, method: 'manual_crop' })]
+  );
+  res.status(201).json(inserted[0]);
+});
+
+// DELETE /api/books/:bookId/pages — delete ALL pages for a book
+router.delete('/', async (req, res) => {
+  await db.query('DELETE FROM pages WHERE book_id = $1', [req.params.bookId]);
+  res.status(204).end();
+});
+
+// DELETE /api/books/:bookId/pages/:pageId
+router.delete('/:pageId', async (req, res) => {
+  const { rowCount } = await db.query(
+    'DELETE FROM pages WHERE id = $1 AND book_id = $2',
+    [req.params.pageId, req.params.bookId]
+  );
+  if (!rowCount) return res.status(404).json({ error: 'Page not found' });
+  res.status(204).end();
+});
+
+module.exports = router;
