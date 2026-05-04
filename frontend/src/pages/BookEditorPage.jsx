@@ -3,15 +3,13 @@ import { useParams } from 'react-router-dom';
 import Header from '../components/layout/Header';
 import UploadZone from '../components/upload/UploadZone';
 import PageGallery from '../components/pages/PageGallery';
-import ReviewPanel from '../components/review/ReviewPanel';
 import ExportButton from '../components/export/ExportButton';
-import { getBook, getPages, getPagesByIds, deleteAllPages } from '../api/client';
+import { getBook, getPages, deleteAllPages } from '../api/client';
 
 export default function BookEditorPage() {
   const { bookId } = useParams();
   const [book, setBook] = useState(null);
   const [pages, setPages] = useState([]);
-  const [reviewPages, setReviewPages] = useState([]); // pages pending review
   const [loading, setLoading] = useState(true);
   const [deletingAll, setDeletingAll] = useState(false);
 
@@ -22,36 +20,9 @@ export default function BookEditorPage() {
       .finally(() => setLoading(false));
   }, [bookId]);
 
-  async function handleUploadComplete({ pageIds }) {
-    if (!pageIds?.length) return;
-    // Fetch the newly added pages for review
-    const newPages = await getPagesByIds(bookId, pageIds);
-    setReviewPages(newPages);
-    // Also add them to the main gallery immediately
-    setPages(prev => {
-      const existingIds = new Set(prev.map(p => p.id));
-      const fresh = newPages.filter(p => !existingIds.has(p.id));
-      return [...prev, ...fresh].sort((a, b) => a.position - b.position);
-    });
-  }
-
-  function handleReviewChange(updatedReviewPages) {
-    setReviewPages(updatedReviewPages);
-    // Sync changes back into the main gallery
-    setPages(prev => {
-      const reviewMap = new Map(updatedReviewPages.map(p => [p.id, p]));
-      const deletedIds = new Set(
-        prev.filter(p => reviewMap.has(p.id) === false && reviewPages.some(r => r.id === p.id))
-          .map(p => p.id)
-      );
-      const mapped = prev
-        .filter(p => !deletedIds.has(p.id))
-        .map(p => reviewMap.get(p.id) || p);
-      // Append any brand-new pages added via manual crop
-      const existingIds = new Set(mapped.map(p => p.id));
-      const added = updatedReviewPages.filter(p => !existingIds.has(p.id));
-      return [...mapped, ...added].sort((a, b) => a.position - b.position);
-    });
+  async function handleUploadComplete() {
+    const updated = await getPages(bookId);
+    setPages(updated);
   }
 
   async function handleDeleteAll() {
@@ -60,18 +31,11 @@ export default function BookEditorPage() {
     try {
       await deleteAllPages(bookId);
       setPages([]);
-      setReviewPages([]);
     } catch (e) {
       console.error(e);
     } finally {
       setDeletingAll(false);
     }
-  }
-
-  function handleDismissReview() {
-    setReviewPages([]);
-    // Re-fetch to get the definitive sorted list
-    getPages(bookId).then(setPages).catch(console.error);
   }
 
   if (loading) {
@@ -103,16 +67,6 @@ export default function BookEditorPage() {
           <UploadZone bookId={bookId} onComplete={handleUploadComplete} />
         </section>
 
-        {/* Review panel — shown after each upload */}
-        {reviewPages.length > 0 && (
-          <ReviewPanel
-            bookId={bookId}
-            pages={reviewPages}
-            onPagesChange={handleReviewChange}
-            onDismiss={handleDismissReview}
-          />
-        )}
-
         {/* Main gallery */}
         <section>
           <div className="flex items-center justify-between mb-3">
@@ -138,7 +92,7 @@ export default function BookEditorPage() {
 
           {pages.length > 0 && (
             <p className="text-xs text-gray-400 mb-4">
-              Trascina per riordinare · × per eliminare
+              Trascina per riordinare · × per eliminare · clicca per modificare
             </p>
           )}
 

@@ -1,6 +1,7 @@
-import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import CropCanvas from '../review/CropCanvas';
 import SplitCanvas from './SplitCanvas';
+import { detectCorners } from '../../api/client';
 
 const SPLIT_METHODS = new Set(['vertical_split', 'spread_split', 'no_contour_spread', 'manual_split']);
 
@@ -85,9 +86,16 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
   const [direction, setDirection] = useState(init.direction);
   const [splitAt, setSplitAt] = useState(init.splitAt);
   const [parts, setParts] = useState(init.parts); // [{rotation, corners}, ...]
-  const [step, setStep] = useState(0); // 0=source, 1=partA/page, 2=partB
+  // Non-split pages open directly on the crop step; split pages start at the source step.
+  const [step, setStep] = useState(init.doSplit ? 0 : 1);
   const [zoom, setZoom] = useState(1);
   const [previewImg, setPreviewImg] = useState(null);
+  const [cropKeys, setCropKeys] = useState([0, 0]);
+  const [autoDetecting, setAutoDetecting] = useState(false);
+
+  // Track the split params that were in effect when corners were last initialised,
+  // so we only reset corners when the user actually changes the split (not on mount).
+  const prevSplitRef = useRef({ splitAt: init.splitAt, direction: init.direction });
 
   const sourceImage = page.source_image || page.source_file;
   const sourceUrl = sourceImage ? `/${sourceImage}` : `/${page.processed_file}`;
@@ -100,8 +108,11 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
     img.src = sourceUrl;
   }, [sourceUrl]);
 
-  // Reset part corners when the split line moves (so the crop canvas reinitialises)
+  // Reset part corners when the split line moves, but not on mount (restored corners survive).
   useEffect(() => {
+    const prev = prevSplitRef.current;
+    if (prev.splitAt === splitAt && prev.direction === direction) return;
+    prevSplitRef.current = { splitAt, direction };
     setParts(prev => prev.map(p => ({ ...p, corners: null })));
   }, [splitAt, direction]);
 
@@ -159,6 +170,25 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
     setParts(prev => prev.map((p, i) => i === idx ? { ...p, [field]: value } : p));
   }
 
+  async function handleAutoDetect(partIdx) {
+    if (!previewImg || !sourceImage) return;
+    setAutoDetecting(true);
+    try {
+      const region = doSplit ? splitRegion(partIdx) : null;
+      const result = await detectCorners(bookId, sourceImage, region);
+      if (result.corners) {
+        updatePart(partIdx, 'corners', result.corners);
+        setCropKeys(prev => prev.map((k, i) => i === partIdx ? k + 1 : k));
+      } else {
+        alert('Nessun contorno trovato automaticamente.');
+      }
+    } catch (e) {
+      console.error('Auto-detect failed:', e);
+    } finally {
+      setAutoDetecting(false);
+    }
+  }
+
   // Step tab definitions
   const steps = [
     { key: 'source', label: 'Sorgente' },
@@ -177,7 +207,7 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
           { corners: parts[0].corners || fullImageCorners(), rotation: parts[0].rotation },
         ];
     const replaceIds = siblings.length > 0 ? siblings.map(p => p.id) : [page.id];
-    onSave({ parts: finalParts, sourceImage, replaceIds });
+    onSave({ parts: finalParts, sourceImage, replaceIds, doSplit, direction, splitAt });
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -224,18 +254,24 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
                 ? <SplitCanvas key={`split-${direction}`} imageUrl={sourceUrl} direction={direction} splitAt={splitAt} onSplitAtChange={setSplitAt} zoom={zoom} />
                 : <div className="flex items-center justify-center h-32 text-gray-400 text-sm">Nessun taglio — vai al passo successivo per ritagliare e ruotare</div>
             )}
-            {step === 1 && (
+            {step === 1 && !previewImg && (
+              <div className="flex items-center justify-center h-32 text-gray-400 text-sm">Caricamento...</div>
+            )}
+            {step === 1 && previewImg && (
               <CropCanvas
-                key={`partA-${doSplit}-${direction}-${Math.round(splitAt * 1000)}`}
+                key={`partA-${doSplit}-${direction}-${Math.round(splitAt * 1000)}-${cropKeys[0]}`}
                 imageUrl={sourceUrl}
                 initialCorners={initCornersFor(0)}
                 onCornersChange={c => updatePart(0, 'corners', c)}
                 zoom={zoom}
               />
             )}
-            {step === 2 && (
+            {step === 2 && !previewImg && (
+              <div className="flex items-center justify-center h-32 text-gray-400 text-sm">Caricamento...</div>
+            )}
+            {step === 2 && previewImg && (
               <CropCanvas
-                key={`partB-${doSplit}-${direction}-${Math.round(splitAt * 1000)}`}
+                key={`partB-${doSplit}-${direction}-${Math.round(splitAt * 1000)}-${cropKeys[1]}`}
                 imageUrl={sourceUrl}
                 initialCorners={initCornersFor(1)}
                 onCornersChange={c => updatePart(1, 'corners', c)}
@@ -307,22 +343,40 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
 
           {/* Step 1 controls (part A or single page) */}
           {step === 1 && (
-            <RotationPicker
-              label={doSplit ? 'Rotazione A' : 'Rotazione'}
-              value={parts[0].rotation}
-              onChange={v => updatePart(0, 'rotation', v)}
-              color="indigo"
-            />
+            <div className="flex items-center gap-4 flex-wrap">
+              <RotationPicker
+                label={doSplit ? 'Rotazione A' : 'Rotazione'}
+                value={parts[0].rotation}
+                onChange={v => updatePart(0, 'rotation', v)}
+                color="indigo"
+              />
+              <button
+                onClick={() => handleAutoDetect(0)}
+                disabled={autoDetecting || !previewImg}
+                className="px-3 py-1.5 rounded-lg border border-gray-300 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+              >
+                {autoDetecting ? '...' : '⊹ Crop automatico'}
+              </button>
+            </div>
           )}
 
           {/* Step 2 controls (part B) */}
           {step === 2 && (
-            <RotationPicker
-              label="Rotazione B"
-              value={parts[1].rotation}
-              onChange={v => updatePart(1, 'rotation', v)}
-              color="emerald"
-            />
+            <div className="flex items-center gap-4 flex-wrap">
+              <RotationPicker
+                label="Rotazione B"
+                value={parts[1].rotation}
+                onChange={v => updatePart(1, 'rotation', v)}
+                color="emerald"
+              />
+              <button
+                onClick={() => handleAutoDetect(1)}
+                disabled={autoDetecting || !previewImg}
+                className="px-3 py-1.5 rounded-lg border border-gray-300 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+              >
+                {autoDetecting ? '...' : '⊹ Crop automatico'}
+              </button>
+            </div>
           )}
 
           {/* Zoom slider (always visible) */}

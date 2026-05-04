@@ -32,6 +32,12 @@ export default function CropCanvas({ imageUrl, initialCorners, onCornersChange, 
   const [dragIdx,    setDragIdx]    = useState(-1);
   const [canvasDims, setCanvasDims] = useState({ w: 0, h: 0 });
 
+  // Keep callback in a ref so the redraw effect doesn't need it in its deps
+  // (otherwise every parent re-render creates a new function, re-triggers the effect,
+  // which calls onCornersChange, which re-renders the parent → infinite loop).
+  const onCornersChangeRef = useRef(onCornersChange);
+  useEffect(() => { onCornersChangeRef.current = onCornersChange; }, [onCornersChange]);
+
   useEffect(() => { dragIdxRef.current = dragIdx; }, [dragIdx]);
 
   // Keep ref in sync so remounts (key-based reset) pick up the latest initialCorners
@@ -148,8 +154,8 @@ export default function CropCanvas({ imageUrl, initialCorners, onCornersChange, 
 
     // Notify parent with corners in original image space
     const scale = scaleRef.current;
-    onCornersChange?.(corners.map(([x, y]) => [x / scale, y / scale]));
-  }, [corners, dragIdx, onCornersChange]);
+    onCornersChangeRef.current?.(corners.map(([x, y]) => [x / scale, y / scale]));
+  }, [corners, dragIdx]); // onCornersChange intentionally omitted — accessed via ref
 
   // ── Pointer helpers ───────────────────────────────────────────────────────
   function getCanvasPos(e) {
@@ -201,8 +207,10 @@ export default function CropCanvas({ imageUrl, initialCorners, onCornersChange, 
     } else {
       // ── Edge: translate both connected corners by the same delta ─────────
       const [lx, ly] = lastPosRef.current;
-      const dx = mx - lx;
-      const dy = my - ly;
+      const edgeIdx = idx - 4;
+      const isHorizontal = edgeIdx % 2 === 0; // top/bottom edges move only in Y
+      const dx = isHorizontal ? 0 : mx - lx;
+      const dy = isHorizontal ? my - ly : 0;
       const [ci0, ci1] = EDGE_CORNERS[idx - 4];
       setCorners(prev => {
         const next = prev.map(c => [...c]);

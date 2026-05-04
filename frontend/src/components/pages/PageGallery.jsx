@@ -43,13 +43,16 @@ export default function PageGallery({ bookId, pages, onPagesChange }) {
     }
   }
 
-  async function handleEditorSave({ parts, sourceImage, replaceIds }) {
+  async function handleEditorSave({ parts, sourceImage, replaceIds, doSplit, direction, splitAt }) {
     setEditSaving(true);
     try {
       const newPages = await editPages(bookId, {
         source_image: sourceImage,
         parts,
         replace_ids: replaceIds,
+        do_split: doSplit,
+        direction,
+        split_at: splitAt,
       });
       onPagesChange(prev => {
         const replaceSet = new Set(replaceIds);

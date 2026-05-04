@@ -29,6 +29,8 @@ export const splitPages = (bookId, body) =>
   api.post(`/books/${bookId}/pages/split`, body).then(r => r.data);
 export const editPages = (bookId, body) =>
   api.post(`/books/${bookId}/pages/edit`, body).then(r => r.data);
+export const detectCorners = (bookId, sourceImage, region = null) =>
+  api.post(`/books/${bookId}/pages/detect-corners`, { source_image: sourceImage, region }).then(r => r.data);
 
 // Upload
 export const uploadFiles = (bookId, files, onProgress) => {

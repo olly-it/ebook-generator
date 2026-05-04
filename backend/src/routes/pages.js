@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router({ mergeParams: true });
 const path = require('path');
 const db = require('../db/client');
-const { cropWithCorners, rotateInPlace, splitImage } = require('../services/imageProcessor');
+const { cropWithCorners, rotateInPlace, splitImage, detectCornersInImage } = require('../services/imageProcessor');
 
 const STORAGE = () => path.resolve(process.env.STORAGE_PATH);
 
@@ -114,12 +114,24 @@ router.post('/:pageId/recrop', async (req, res) => {
   res.json(updated[0]);
 });
 
+// POST /api/books/:bookId/pages/detect-corners
+// Body: { source_image, region?: {x,y,w,h} }
+// Runs contour detection on the source image (or a region of it).
+// Returns { corners: [[x,y]×4] } in source image coords, or { corners: null }.
+router.post('/detect-corners', async (req, res) => {
+  const { source_image, region } = req.body;
+  if (!source_image) return res.status(400).json({ error: 'source_image required' });
+  const sourceAbs = path.join(STORAGE(), source_image);
+  const corners = await detectCornersInImage(sourceAbs, region || null);
+  res.json({ corners });
+});
+
 // POST /api/books/:bookId/pages/edit
-// Body: { source_image, parts: [{corners, rotation}], replace_ids? }
+// Body: { source_image, parts: [{corners, rotation}], replace_ids?, do_split?, direction?, split_at? }
 // Re-processes N parts from the source image (perspective crop + rotation each),
 // replaces replace_ids pages with the new results.
 router.post('/edit', async (req, res) => {
-  const { source_image, parts, replace_ids = [] } = req.body;
+  const { source_image, parts, replace_ids = [], do_split = false, direction = 'horizontal', split_at = 0.5 } = req.body;
   if (!source_image || !Array.isArray(parts) || parts.length === 0) {
     return res.status(400).json({ error: 'source_image and parts[] required' });
   }
@@ -149,6 +161,7 @@ router.post('/edit', async (req, res) => {
     insertPos = parseFloat(rows[0].max_pos) + 1;
   }
 
+  const splitLabels = direction === 'horizontal' ? ['top', 'bottom'] : ['left', 'right'];
   const inserted = [];
   for (let i = 0; i < parts.length; i++) {
     const { corners, rotation = 0 } = parts[i];
@@ -156,11 +169,14 @@ router.post('/edit', async (req, res) => {
     if (!result.length) continue;
     const p = result[0];
     const rel = path.relative(storage, path.join(outDir, p.filename));
+    const partMeta = do_split
+      ? { method: 'manual_split', split_from: splitLabels[i], split_at, split_direction: direction, rotation, contour_pts: corners }
+      : { method: 'manual_crop', rotation, contour_pts: corners };
     const { rows } = await db.query(
       `INSERT INTO pages (book_id, position, source_file, source_image, processed_file, width_px, height_px, processing_meta)
        VALUES ($1, $2, $3, $3, $4, $5, $6, $7) RETURNING *`,
       [req.params.bookId, insertPos + i * 0.01, source_image, rel,
-       p.width, p.height, JSON.stringify({ ...p.processing_meta, method: 'manual_crop' })]
+       p.width, p.height, JSON.stringify({ ...p.processing_meta, ...partMeta })]
     );
     inserted.push(rows[0]);
   }

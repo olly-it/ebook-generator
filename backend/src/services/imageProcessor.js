@@ -95,4 +95,30 @@ function splitImage(sourceImagePath, direction, splitAt, rotateA, rotateB, outDi
   ]);
 }
 
-module.exports = { processImage, cropWithCorners, rotateInPlace, splitImage };
+/**
+ * Detect the page contour corners in a source image (or a rectangular region of it).
+ * region: { x, y, w, h } in source image coordinates, or null for the full image.
+ * Returns [[x,y],[x,y],[x,y],[x,y]] in source image coordinates, or null.
+ */
+function detectCornersInImage(sourceImagePath, region) {
+  const args = ['--detect-corners', '--input', sourceImagePath];
+  if (region) args.push('--region', JSON.stringify([region.x, region.y, region.w, region.h]));
+  return new Promise((resolve, reject) => {
+    const proc = spawn(PYTHON(), [SCRIPT, ...args]);
+    let stdout = '', stderr = '';
+    proc.stdout.on('data', d => (stdout += d.toString()));
+    proc.stderr.on('data', d => (stderr += d.toString()));
+    proc.on('close', code => {
+      if (code !== 0) return reject(new Error(`Python failed: ${stderr.slice(0, 300)}`));
+      try {
+        const result = JSON.parse(stdout.trim());
+        resolve(result.corners || null);
+      } catch {
+        reject(new Error(`Bad Python output: ${stdout.slice(0, 200)}`));
+      }
+    });
+    proc.on('error', err => reject(new Error(`Failed to start Python: ${err.message}`)));
+  });
+}
+
+module.exports = { processImage, cropWithCorners, rotateInPlace, splitImage, detectCornersInImage };

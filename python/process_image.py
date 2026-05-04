@@ -26,7 +26,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 from detector import find_page_contours, is_double_spread, find_gutter, auto_orient, _is_vertical_double
-from perspective import four_point_transform
+from perspective import four_point_transform, order_points
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +137,7 @@ def process_image_array(image, source_path, outdir, extra_rotation=0):
         for i, quad in enumerate(quads):
             pts = quad / scale
             p = warp_and_orient(pts,
-                {'contour_pts': pts.tolist(), 'method': 'multi_quad', 'quad_index': i},
+                {'contour_pts': order_points(pts).tolist(), 'method': 'multi_quad', 'quad_index': i},
                 suffix=f'_{i}')
             if p:
                 pages.append(p)
@@ -151,12 +151,12 @@ def process_image_array(image, source_path, outdir, extra_rotation=0):
             warped = image  # fallback to full image
 
         if is_double_spread(warped):
-            pages.extend(_split_spread(warped, pts.tolist(), source_path, outdir, extra_rotation))
+            pages.extend(_split_spread(warped, source_path, outdir, extra_rotation, source_pts=pts))
         elif _is_vertical_double(warped):
-            pages.extend(_split_vertical_double(warped, source_path, outdir, extra_rotation))
+            pages.extend(_split_vertical_double(warped, source_path, outdir, extra_rotation, source_pts=pts))
         else:
             oriented, auto_rot = auto_orient(warped)
-            meta = {'contour_pts': pts.tolist(), 'method': 'single_quad'}
+            meta = {'contour_pts': order_points(pts).tolist(), 'method': 'single_quad'}
             if auto_rot:
                 meta['auto_rotation_deg'] = auto_rot
             if extra_rotation:
@@ -171,13 +171,15 @@ def process_image_array(image, source_path, outdir, extra_rotation=0):
     # portrait with two sideways pages stacked → split top/bottom;
     # otherwise treat as single page.
     if is_double_spread(image):
-        pages.extend(_split_spread(image, None, source_path, outdir, extra_rotation,
+        pages.extend(_split_spread(image, source_path, outdir, extra_rotation,
                                    method='no_contour_spread'))
     elif _is_vertical_double(image):
         pages.extend(_split_vertical_double(image, source_path, outdir, extra_rotation))
     else:
         oriented, auto_rot = auto_orient(image)
-        meta = {'method': 'no_contour_fallback'}
+        fh, fw = image.shape[:2]
+        meta = {'method': 'no_contour_fallback',
+                'contour_pts': [[0, 0], [fw, 0], [fw, fh], [0, fh]]}
         if auto_rot:
             meta['auto_rotation_deg'] = auto_rot
         if extra_rotation:
@@ -189,14 +191,43 @@ def process_image_array(image, source_path, outdir, extra_rotation=0):
     return pages
 
 
-def _split_vertical_double(image, source_path, outdir, extra_rotation, method='vertical_split'):
-    """Split a portrait image of two pages scanned sideways (stacked top/bottom)."""
-    h = image.shape[0]
+def _split_vertical_double(image, source_path, outdir, extra_rotation, method='vertical_split', source_pts=None):
+    """Split a portrait image of two pages scanned sideways (stacked top/bottom).
+
+    source_pts: optional (4,2) array of the detected quad in SOURCE image coordinates.
+    When given, the per-half contour_pts are projected from that quad so they survive
+    back to source image space even if `image` is perspective-corrected.
+    """
+    h, w = image.shape[:2]
     mid = h // 2
+
+    # Compute per-half contour_pts in source image coordinates
+    if source_pts is not None:
+        tl, tr, br, bl = order_points(source_pts)
+        t = 0.5  # split at midpoint of the warped quad height
+        mid_r = tr + (br - tr) * t
+        mid_l = tl + (bl - tl) * t
+        # Explicitly TL/TR/BR/BL — do NOT apply order_points to sub-quads.
+        # order_points uses sum/diff heuristics that work for rectangles but swap
+        # TR and BL on the trapezoidal sub-quads produced by a mid-edge split.
+        half_pts = [
+            [tl.tolist(), tr.tolist(), mid_r.tolist(), mid_l.tolist()],
+            [mid_l.tolist(), mid_r.tolist(), br.tolist(), bl.tolist()],
+        ]
+    else:
+        half_pts = [
+            [[0, 0], [w, 0], [w, mid], [0, mid]],
+            [[0, mid], [w, mid], [w, h], [0, h]],
+        ]
+
     pages = []
-    for side, half in [('top', image[:mid, :]), ('bottom', image[mid:, :])]:
+    for i, (side, half) in enumerate([('top', image[:mid, :]), ('bottom', image[mid:, :])]):
         oriented, auto_rot = auto_orient(half)
-        meta = {'method': method, 'split_from': side}
+        meta = {
+            'method': method, 'split_from': side,
+            'split_at': 0.5, 'split_direction': 'horizontal',
+            'contour_pts': half_pts[i],
+        }
         if auto_rot:
             meta['auto_rotation_deg'] = auto_rot
         if extra_rotation:
@@ -207,16 +238,43 @@ def _split_vertical_double(image, source_path, outdir, extra_rotation, method='v
     return pages
 
 
-def _split_spread(image, contour_pts, source_path, outdir, extra_rotation, method='spread_split'):
-    """Split a double-page spread at the detected gutter."""
+def _split_spread(image, source_path, outdir, extra_rotation, method='spread_split', source_pts=None):
+    """Split a double-page spread at the detected gutter.
+
+    source_pts: optional (4,2) array of the detected quad in SOURCE image coordinates.
+    When given, the per-half contour_pts are projected from that quad.
+    """
+    h, w = image.shape[:2]
     gutter_x = find_gutter(image)
+    t = gutter_x / w  # fraction of split along image width
+
+    # Compute per-half contour_pts in source image coordinates
+    if source_pts is not None:
+        tl, tr, br, bl = order_points(source_pts)
+        top_mid = tl + (tr - tl) * t
+        bot_mid = bl + (br - bl) * t
+        # Explicitly TL/TR/BR/BL — same reasoning as _split_vertical_double.
+        half_pts = [
+            [tl.tolist(), top_mid.tolist(), bot_mid.tolist(), bl.tolist()],
+            [top_mid.tolist(), tr.tolist(), br.tolist(), bot_mid.tolist()],
+        ]
+        split_at = t
+    else:
+        half_pts = [
+            [[0, 0], [gutter_x, 0], [gutter_x, h], [0, h]],
+            [[gutter_x, 0], [w, 0], [w, h], [gutter_x, h]],
+        ]
+        split_at = t
+
     pages = []
-    for side, crop in [('left', image[:, :gutter_x]), ('right', image[:, gutter_x:])]:
+    for i, (side, crop) in enumerate([('left', image[:, :gutter_x]), ('right', image[:, gutter_x:])]):
         if crop.shape[1] < 50:
             continue
-        meta = {'method': method, 'split_from': side, 'gutter_x': gutter_x}
-        if contour_pts:
-            meta['contour_pts'] = contour_pts
+        meta = {
+            'method': method, 'split_from': side,
+            'split_at': split_at, 'split_direction': 'vertical',
+            'contour_pts': half_pts[i],
+        }
         if extra_rotation:
             crop = _rotate_cv(crop, extra_rotation)
         fn, pw, ph = _save(crop, outdir, f'_{side}')
@@ -301,6 +359,8 @@ def main():
     parser.add_argument('--split-at', type=float, default=0.5)
     parser.add_argument('--rotate-a', type=int, default=0)
     parser.add_argument('--rotate-b', type=int, default=0)
+    parser.add_argument('--detect-corners', action='store_true')
+    parser.add_argument('--region')   # JSON "[x, y, w, h]" in source image coords
     args = parser.parse_args()
 
     try:
@@ -310,6 +370,31 @@ def main():
             if err:
                 print(json.dumps({'pages': [], 'error': err})); sys.exit(1)
             print(json.dumps({'pages': [result], 'error': None}))
+            return
+
+        # ── Detect corners mode ───────────────────────────────────────────
+        if args.detect_corners:
+            if not args.input:
+                print(json.dumps({'corners': None, 'error': '--input required'})); sys.exit(1)
+            image = load_image(args.input)
+            if image is None:
+                print(json.dumps({'corners': None, 'error': f'Cannot read {args.input}'})); sys.exit(1)
+            offset_x, offset_y = 0, 0
+            detect_img = image
+            if args.region:
+                rx, ry, rw, rh = [int(v) for v in json.loads(args.region)]
+                detect_img = image[ry:ry + rh, rx:rx + rw]
+                offset_x, offset_y = rx, ry
+            h, w = detect_img.shape[:2]
+            scale = min(1.0, 2000 / max(h, w)) if max(h, w) > 2000 else 1.0
+            small = cv2.resize(detect_img, (int(w * scale), int(h * scale))) if scale < 1 else detect_img
+            quads = find_page_contours(small)
+            if quads:
+                pts = (quads[0] / scale).tolist()
+                pts = [[x + offset_x, y + offset_y] for x, y in pts]
+                print(json.dumps({'corners': pts, 'error': None}))
+            else:
+                print(json.dumps({'corners': None, 'error': None}))
             return
 
         # ── Manual split mode ─────────────────────────────────────────────
