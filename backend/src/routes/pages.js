@@ -6,6 +6,27 @@ const { cropWithCorners, rotateInPlace, splitImage, detectCornersInImage } = req
 
 const STORAGE = () => path.resolve(process.env.STORAGE_PATH);
 
+// Look up provenance fields (original upload filename + PDF page index) for a
+// given source_image — these are stable per source, so any existing page from
+// the same source is a valid donor. Falls back to deriving the page index from
+// the `src_pdf_p<N>_*` filename when no donor is available.
+async function provenanceFor(bookId, sourceImage) {
+  const out = {};
+  if (!sourceImage) return out;
+  const { rows } = await db.query(
+    `SELECT processing_meta FROM pages WHERE book_id = $1 AND source_image = $2 LIMIT 1`,
+    [bookId, sourceImage]
+  );
+  const donor = rows[0]?.processing_meta || {};
+  if (donor.original_filename) out.original_filename = donor.original_filename;
+  if (donor.original_page_index != null) out.original_page_index = donor.original_page_index;
+  if (out.original_page_index == null) {
+    const m = path.basename(sourceImage).match(/^src_pdf_p(\d+)_/);
+    if (m) out.original_page_index = parseInt(m[1], 10);
+  }
+  return out;
+}
+
 // GET /api/books/:bookId/pages
 router.get('/', async (req, res) => {
   const { rows } = await db.query(
@@ -104,10 +125,14 @@ router.post('/:pageId/recrop', async (req, res) => {
   const newPage = pages[0];
   const processedRel = path.relative(storage, path.join(outDir, newPage.filename));
 
+  const old = page.processing_meta || {};
+  const provenance = {};
+  if (old.original_filename) provenance.original_filename = old.original_filename;
+  if (old.original_page_index != null) provenance.original_page_index = old.original_page_index;
   await db.query(
     `UPDATE pages SET processed_file = $1, width_px = $2, height_px = $3, processing_meta = $4 WHERE id = $5`,
     [processedRel, newPage.width, newPage.height,
-     JSON.stringify({ ...newPage.processing_meta, method: 'manual_recrop' }), page.id]
+     JSON.stringify({ ...newPage.processing_meta, ...provenance, method: 'manual_recrop' }), page.id]
   );
 
   const { rows: updated } = await db.query('SELECT * FROM pages WHERE id = $1', [page.id]);
@@ -139,6 +164,7 @@ router.post('/edit', async (req, res) => {
   const storage = STORAGE();
   const sourceAbs = path.join(storage, source_image);
   const outDir = path.join(storage, 'processed', req.params.bookId);
+  const provenance = await provenanceFor(req.params.bookId, source_image);
 
   // Determine insert position and delete replaced pages
   let insertPos = 1;
@@ -176,7 +202,7 @@ router.post('/edit', async (req, res) => {
       `INSERT INTO pages (book_id, position, source_file, source_image, processed_file, width_px, height_px, processing_meta)
        VALUES ($1, $2, $3, $3, $4, $5, $6, $7) RETURNING *`,
       [req.params.bookId, insertPos + i * 0.01, source_image, rel,
-       p.width, p.height, JSON.stringify({ ...p.processing_meta, ...partMeta })]
+       p.width, p.height, JSON.stringify({ ...p.processing_meta, ...provenance, ...partMeta })]
     );
     inserted.push(rows[0]);
   }
@@ -196,6 +222,7 @@ router.post('/split', async (req, res) => {
   const storage = STORAGE();
   const sourceAbs = path.join(storage, source_image);
   const outDir = path.join(storage, 'processed', req.params.bookId);
+  const provenance = await provenanceFor(req.params.bookId, source_image);
 
   const parts = await splitImage(sourceAbs, direction, split_at, rotate_a, rotate_b, outDir);
   if (!parts.length) return res.status(500).json({ error: 'Split produced no pages' });
@@ -229,7 +256,7 @@ router.post('/split', async (req, res) => {
       `INSERT INTO pages (book_id, position, source_file, source_image, processed_file, width_px, height_px, processing_meta)
        VALUES ($1, $2, $3, $3, $4, $5, $6, $7) RETURNING *`,
       [req.params.bookId, insertPos + i * 0.01, source_image, processedRel,
-       p.width, p.height, JSON.stringify(p.processing_meta)]
+       p.width, p.height, JSON.stringify({ ...p.processing_meta, ...provenance })]
     );
     inserted.push(rows[0]);
   }
@@ -249,6 +276,7 @@ router.post('/manual-crop', async (req, res) => {
   const storage = STORAGE();
   const sourceAbs = path.join(storage, source_image);
   const outDir = path.join(storage, 'processed', req.params.bookId);
+  const provenance = await provenanceFor(req.params.bookId, source_image);
 
   const pages = await cropWithCorners(sourceAbs, corners, rotation, outDir);
   if (!pages.length) return res.status(500).json({ error: 'Processing returned no pages' });
@@ -271,7 +299,7 @@ router.post('/manual-crop', async (req, res) => {
      VALUES ($1, $2, $3, $3, $4, $5, $6, $7) RETURNING *`,
     [req.params.bookId, pos, source_image, processedRel,
      newPage.width, newPage.height,
-     JSON.stringify({ ...newPage.processing_meta, method: 'manual_crop' })]
+     JSON.stringify({ ...newPage.processing_meta, ...provenance, method: 'manual_crop' })]
   );
   res.status(201).json(inserted[0]);
 });

@@ -12,22 +12,62 @@ function inferDirection(meta) {
   return 'horizontal';
 }
 
+// Reconstruct the full source quad [TL, TR, BR, BL] from two split halves'
+// contour_pts. Python emits these as (see _split_spread / _split_vertical_double):
+//   horizontal split: A = [tl, tr, mid_r, mid_l], B = [mid_l, mid_r, br, bl]
+//   vertical   split: A = [tl, top_mid, bot_mid, bl], B = [top_mid, tr, br, bot_mid]
+// Returns null when either half lacks a 4-point contour.
+function reconstructOriginalQuad(aCorners, bCorners, direction) {
+  if (!aCorners || !bCorners || aCorners.length !== 4 || bCorners.length !== 4) return null;
+  if (direction === 'horizontal') {
+    return [aCorners[0], aCorners[1], bCorners[2], bCorners[3]];
+  }
+  return [aCorners[0], bCorners[1], bCorners[2], aCorners[3]];
+}
+
+// Project a quad [TL, TR, BR, BL] onto a half at split ratio t for a given
+// direction. Returns the half's [TL, TR, BR, BL] in source coordinates.
+function projectHalf(quad, direction, t, half) {
+  const [tl, tr, br, bl] = quad;
+  const lerp = (p, q, k) => [p[0] + (q[0] - p[0]) * k, p[1] + (q[1] - p[1]) * k];
+  if (direction === 'horizontal') {
+    const midL = lerp(tl, bl, t);
+    const midR = lerp(tr, br, t);
+    return half === 0 ? [tl, tr, midR, midL] : [midL, midR, br, bl];
+  }
+  const topMid = lerp(tl, tr, t);
+  const botMid = lerp(bl, br, t);
+  return half === 0 ? [tl, topMid, botMid, bl] : [topMid, tr, br, botMid];
+}
+
 // Restore previous state from page meta + siblings
 function initFromMeta(page, siblings) {
   const meta = page.processing_meta || {};
   const isSplit = SPLIT_METHODS.has(meta.method);
 
   if (isSplit) {
-    const allMeta = siblings.map(s => s.processing_meta || {});
-    const aMeta = allMeta.find(m => m.split_from === 'top' || m.split_from === 'left') || {};
-    const bMeta = allMeta.find(m => m.split_from === 'bottom' || m.split_from === 'right') || {};
+    const aSib = siblings.find(s => {
+      const m = s.processing_meta || {}; return m.split_from === 'top' || m.split_from === 'left';
+    });
+    const bSib = siblings.find(s => {
+      const m = s.processing_meta || {}; return m.split_from === 'bottom' || m.split_from === 'right';
+    });
+    const aMeta = aSib?.processing_meta || {};
+    const bMeta = bSib?.processing_meta || {};
+    const direction = inferDirection(meta);
+    const originalQuad = reconstructOriginalQuad(
+      aMeta.contour_pts ?? null,
+      bMeta.contour_pts ?? null,
+      direction,
+    );
     return {
       doSplit: true,
-      direction: inferDirection(meta),
+      direction,
       splitAt: meta.split_at ?? 0.5,
+      originalQuad,
       parts: [
-        { rotation: aMeta.rotation ?? aMeta.auto_rotation_deg ?? 0, corners: aMeta.contour_pts ?? null },
-        { rotation: bMeta.rotation ?? bMeta.auto_rotation_deg ?? 0, corners: bMeta.contour_pts ?? null },
+        { rotation: aMeta.rotation ?? aMeta.auto_rotation_deg ?? 0, corners: aMeta.contour_pts ?? null, processedFile: aSib?.processed_file ?? null },
+        { rotation: bMeta.rotation ?? bMeta.auto_rotation_deg ?? 0, corners: bMeta.contour_pts ?? null, processedFile: bSib?.processed_file ?? null },
       ],
     };
   }
@@ -36,20 +76,33 @@ function initFromMeta(page, siblings) {
     doSplit: false,
     direction: 'horizontal',
     splitAt: 0.5,
+    originalQuad: null,
     parts: [
-      { rotation: meta.rotation ?? meta.auto_rotation_deg ?? 0, corners: meta.contour_pts ?? null },
-      { rotation: 0, corners: null },
+      { rotation: meta.rotation ?? meta.auto_rotation_deg ?? 0, corners: meta.contour_pts ?? null, processedFile: page.processed_file ?? null },
+      { rotation: 0, corners: null, processedFile: null },
     ],
   };
 }
 
+// Pixel-tolerant deep comparison for corner arrays
+function cornersEqual(a, b, eps = 0.5) {
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (Math.abs(a[i][0] - b[i][0]) > eps || Math.abs(a[i][1] - b[i][1]) > eps) return false;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
-// OutputPreview — live canvas rendering a region of the source image, rotated
+// OutputPreview — when corners are unchanged from the saved state, show the
+// existing processed thumbnail (pixel-identical to the gallery). When the user
+// drags a corner, fall back to a live canvas approximating the new crop.
 // ---------------------------------------------------------------------------
-function OutputPreview({ img, region, rotation, label, accent }) {
+function OutputPreview({ img, region, rotation, label, accent, staticUrl }) {
   const canvasRef = useRef(null);
 
   useEffect(() => {
+    if (staticUrl) return;
     const canvas = canvasRef.current;
     if (!canvas || !img || !region || region.w <= 0 || region.h <= 0) return;
     const { x, y, w, h } = region;
@@ -66,12 +119,20 @@ function OutputPreview({ img, region, rotation, label, accent }) {
     ctx.rotate((rotation * Math.PI) / 180);
     ctx.drawImage(img, x, y, w, h, -(w * scale) / 2, -(h * scale) / 2, w * scale, h * scale);
     ctx.restore();
-  }, [img, region, rotation]);
+  }, [img, region, rotation, staticUrl]);
 
   return (
     <div className="flex flex-col items-center gap-1">
       <span className={`text-[11px] font-semibold ${accent}`}>{label}</span>
-      <canvas ref={canvasRef} style={{ maxWidth: '100%', border: '1px solid #e5e7eb', borderRadius: 4, display: 'block' }} />
+      {staticUrl ? (
+        <img
+          src={staticUrl}
+          alt={label}
+          style={{ maxWidth: '100%', maxHeight: 190, border: '1px solid #e5e7eb', borderRadius: 4, display: 'block' }}
+        />
+      ) : (
+        <canvas ref={canvasRef} style={{ maxWidth: '100%', border: '1px solid #e5e7eb', borderRadius: 4, display: 'block' }} />
+      )}
     </div>
   );
 }
@@ -96,6 +157,12 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
   // Track the split params that were in effect when corners were last initialised,
   // so we only reset corners when the user actually changes the split (not on mount).
   const prevSplitRef = useRef({ splitAt: init.splitAt, direction: init.direction });
+  // Once the user manually drags a corner, stop reprojecting that part on split changes.
+  const manualCornersRef = useRef([false, false]);
+  // The detected source quad (full page, in source image coords) — if available,
+  // we use it to reproject per-half corners as the split moves, preserving
+  // perspective correction across split adjustments.
+  const originalQuadRef = useRef(init.originalQuad);
 
   const sourceImage = page.source_image || page.source_file;
   const sourceUrl = sourceImage ? `/${sourceImage}` : `/${page.processed_file}`;
@@ -108,12 +175,24 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
     img.src = sourceUrl;
   }, [sourceUrl]);
 
-  // Reset part corners when the split line moves, but not on mount (restored corners survive).
+  // When the split line moves, reproject each part's corners along the original
+  // detected quad so perspective correction is preserved. If no quad was detected
+  // (or the user has manually edited a part's corners), leave that part alone —
+  // initCornersFor will fall back to a plain rectangular split region.
   useEffect(() => {
     const prev = prevSplitRef.current;
     if (prev.splitAt === splitAt && prev.direction === direction) return;
+    const directionChanged = prev.direction !== direction;
     prevSplitRef.current = { splitAt, direction };
-    setParts(prev => prev.map(p => ({ ...p, corners: null })));
+    const quad = originalQuadRef.current;
+    setParts(prevParts => prevParts.map((p, i) => {
+      if (manualCornersRef.current[i]) return p;
+      // Direction change invalidates the quad mapping; fall back to rect regions.
+      if (!quad || directionChanged) return { ...p, corners: null };
+      return { ...p, corners: projectHalf(quad, direction, splitAt, i) };
+    }));
+    if (directionChanged) originalQuadRef.current = null;
+    setCropKeys(ks => ks.map(k => k + 1));
   }, [splitAt, direction]);
 
   // Compute the 4-corner rectangle for a split part (in source image coordinates)
@@ -152,6 +231,19 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
     return null; // CropCanvas defaults to 5% inset
   }
 
+  // Show the saved gallery thumbnail when corners + rotation + split match the
+  // saved state — gives a pixel-perfect preview that matches what the user sees
+  // in the gallery. Once anything changes, fall back to the dynamic canvas.
+  function staticPreviewUrl(idx) {
+    const orig = init.parts[idx];
+    if (!orig?.processedFile) return null;
+    if (parts[idx].rotation !== orig.rotation) return null;
+    if (!cornersEqual(parts[idx].corners, orig.corners)) return null;
+    if (doSplit !== init.doSplit) return null;
+    if (init.doSplit && (direction !== init.direction || splitAt !== init.splitAt)) return null;
+    return `/${orig.processedFile}`;
+  }
+
   // Region for OutputPreview: bounding box of corners or split region
   function previewRegion(idx) {
     const corners = parts[idx].corners;
@@ -170,6 +262,21 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
     setParts(prev => prev.map((p, i) => i === idx ? { ...p, [field]: value } : p));
   }
 
+  // Called when CropCanvas reports new corners. CropCanvas emits on every redraw
+  // (including the initial mount), so to detect a real user drag we compare
+  // against the corners we last fed in. Once we see a meaningful change, we
+  // mark the part as "manually edited" so the split-line useEffect stops
+  // reprojecting its corners from the original detected quad.
+  function handleUserCornersChange(idx, corners) {
+    setParts(prev => {
+      const cur = prev[idx];
+      if (!cornersEqual(cur.corners, corners)) {
+        manualCornersRef.current[idx] = true;
+      }
+      return prev.map((p, i) => i === idx ? { ...p, corners } : p);
+    });
+  }
+
   async function handleAutoDetect(partIdx) {
     if (!previewImg || !sourceImage) return;
     setAutoDetecting(true);
@@ -177,6 +284,7 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
       const region = doSplit ? splitRegion(partIdx) : null;
       const result = await detectCorners(bookId, sourceImage, region);
       if (result.corners) {
+        manualCornersRef.current[partIdx] = true;
         updatePart(partIdx, 'corners', result.corners);
         setCropKeys(prev => prev.map((k, i) => i === partIdx ? k + 1 : k));
       } else {
@@ -262,7 +370,7 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
                 key={`partA-${doSplit}-${direction}-${Math.round(splitAt * 1000)}-${cropKeys[0]}`}
                 imageUrl={sourceUrl}
                 initialCorners={initCornersFor(0)}
-                onCornersChange={c => updatePart(0, 'corners', c)}
+                onCornersChange={c => handleUserCornersChange(0, c)}
                 zoom={zoom}
               />
             )}
@@ -274,7 +382,7 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
                 key={`partB-${doSplit}-${direction}-${Math.round(splitAt * 1000)}-${cropKeys[1]}`}
                 imageUrl={sourceUrl}
                 initialCorners={initCornersFor(1)}
-                onCornersChange={c => updatePart(1, 'corners', c)}
+                onCornersChange={c => handleUserCornersChange(1, c)}
                 zoom={zoom}
               />
             )}
@@ -292,6 +400,7 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
                   rotation={parts[0].rotation}
                   label={doSplit ? 'Pagina A' : 'Pagina'}
                   accent="text-indigo-600"
+                  staticUrl={staticPreviewUrl(0)}
                 />
                 {doSplit && (
                   <OutputPreview
@@ -300,6 +409,7 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
                     rotation={parts[1].rotation}
                     label="Pagina B"
                     accent="text-emerald-600"
+                    staticUrl={staticPreviewUrl(1)}
                   />
                 )}
               </>

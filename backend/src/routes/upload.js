@@ -65,11 +65,17 @@ async function processFiles(bookId, files, jobId) {
         const sourceAbs = page.source_image || file.path;
         const sourceRel = path.relative(storage, sourceAbs);
 
+        // Track provenance: original upload filename + (for PDFs) the page index
+        // encoded by Python in `src_pdf_p<N>_*.jpg`.
+        const meta = { ...(page.processing_meta || {}), original_filename: file.originalname };
+        const pdfMatch = path.basename(sourceRel).match(/^src_pdf_p(\d+)_/);
+        if (pdfMatch) meta.original_page_index = parseInt(pdfMatch[1], 10);
+
         const { rows: inserted } = await db.query(
           `INSERT INTO pages (book_id, position, source_file, source_image, processed_file, width_px, height_px, processing_meta)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
           [bookId, posCounter, sourceRel, sourceRel, processedRel,
-           page.width, page.height, JSON.stringify(page.processing_meta || {})]
+           page.width, page.height, JSON.stringify(meta)]
         );
         newPageIds.push(inserted[0].id);
         posCounter += 1;

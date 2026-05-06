@@ -151,9 +151,11 @@ def process_image_array(image, source_path, outdir, extra_rotation=0):
             warped = image  # fallback to full image
 
         if is_double_spread(warped):
-            pages.extend(_split_spread(warped, source_path, outdir, extra_rotation, source_pts=pts))
+            pages.extend(_split_spread(warped, source_path, outdir, extra_rotation,
+                                       source_pts=pts, source_shape=image.shape[:2]))
         elif _is_vertical_double(warped):
-            pages.extend(_split_vertical_double(warped, source_path, outdir, extra_rotation, source_pts=pts))
+            pages.extend(_split_vertical_double(warped, source_path, outdir, extra_rotation,
+                                                source_pts=pts, source_shape=image.shape[:2]))
         else:
             oriented, auto_rot = auto_orient(warped)
             meta = {'contour_pts': order_points(pts).tolist(), 'method': 'single_quad'}
@@ -191,12 +193,15 @@ def process_image_array(image, source_path, outdir, extra_rotation=0):
     return pages
 
 
-def _split_vertical_double(image, source_path, outdir, extra_rotation, method='vertical_split', source_pts=None):
+def _split_vertical_double(image, source_path, outdir, extra_rotation, method='vertical_split', source_pts=None, source_shape=None):
     """Split a portrait image of two pages scanned sideways (stacked top/bottom).
 
     source_pts: optional (4,2) array of the detected quad in SOURCE image coordinates.
     When given, the per-half contour_pts are projected from that quad so they survive
     back to source image space even if `image` is perspective-corrected.
+    source_shape: (h, w) of the source image; required when source_pts is given so
+    `split_at` can be expressed as a fraction of source-image height (the editor UI
+    overlays the split line on the source image, not on the warped one).
     """
     h, w = image.shape[:2]
     mid = h // 2
@@ -214,18 +219,21 @@ def _split_vertical_double(image, source_path, outdir, extra_rotation, method='v
             [tl.tolist(), tr.tolist(), mid_r.tolist(), mid_l.tolist()],
             [mid_l.tolist(), mid_r.tolist(), br.tolist(), bl.tolist()],
         ]
+        sh, sw = source_shape if source_shape is not None else (h, w)
+        split_at = float((mid_l[1] + mid_r[1]) / 2.0 / sh)
     else:
         half_pts = [
             [[0, 0], [w, 0], [w, mid], [0, mid]],
             [[0, mid], [w, mid], [w, h], [0, h]],
         ]
+        split_at = 0.5
 
     pages = []
     for i, (side, half) in enumerate([('top', image[:mid, :]), ('bottom', image[mid:, :])]):
         oriented, auto_rot = auto_orient(half)
         meta = {
             'method': method, 'split_from': side,
-            'split_at': 0.5, 'split_direction': 'horizontal',
+            'split_at': split_at, 'split_direction': 'horizontal',
             'contour_pts': half_pts[i],
         }
         if auto_rot:
@@ -238,15 +246,18 @@ def _split_vertical_double(image, source_path, outdir, extra_rotation, method='v
     return pages
 
 
-def _split_spread(image, source_path, outdir, extra_rotation, method='spread_split', source_pts=None):
+def _split_spread(image, source_path, outdir, extra_rotation, method='spread_split', source_pts=None, source_shape=None):
     """Split a double-page spread at the detected gutter.
 
     source_pts: optional (4,2) array of the detected quad in SOURCE image coordinates.
     When given, the per-half contour_pts are projected from that quad.
+    source_shape: (h, w) of the source image; required when source_pts is given so
+    `split_at` can be expressed as a fraction of source-image width (the editor UI
+    overlays the split line on the source image, not on the warped one).
     """
     h, w = image.shape[:2]
     gutter_x = find_gutter(image)
-    t = gutter_x / w  # fraction of split along image width
+    t = gutter_x / w  # fraction of split along the warped quad's width
 
     # Compute per-half contour_pts in source image coordinates
     if source_pts is not None:
@@ -258,7 +269,8 @@ def _split_spread(image, source_path, outdir, extra_rotation, method='spread_spl
             [tl.tolist(), top_mid.tolist(), bot_mid.tolist(), bl.tolist()],
             [top_mid.tolist(), tr.tolist(), br.tolist(), bot_mid.tolist()],
         ]
-        split_at = t
+        sh, sw = source_shape if source_shape is not None else (h, w)
+        split_at = float((top_mid[0] + bot_mid[0]) / 2.0 / sw)
     else:
         half_pts = [
             [[0, 0], [gutter_x, 0], [gutter_x, h], [0, h]],

@@ -3,6 +3,22 @@ import { DragDropContext, Droppable, Draggable } from '@hello-pangea/dnd';
 import { reorderPages, deletePage, editPages } from '../../api/client';
 import PageEditorModal from '../editor/PageEditorModal';
 
+// Best-effort provenance label for legacy pages where no original_filename was
+// captured at import time: derive the PDF page index from `src_pdf_p<N>_*`.
+function provenanceLabel(page) {
+  const meta = page.processing_meta || {};
+  let name = meta.original_filename || null;
+  let pageIdx = meta.original_page_index;
+  if (pageIdx == null && page.source_image) {
+    const m = /\/src_pdf_p(\d+)_/.exec(page.source_image);
+    if (m) pageIdx = parseInt(m[1], 10);
+  }
+  if (!name && pageIdx == null) return null;
+  if (name && pageIdx != null) return `${name} · p. ${pageIdx + 1}`;
+  if (pageIdx != null) return `p. ${pageIdx + 1}`;
+  return name;
+}
+
 export default function PageGallery({ bookId, pages, onPagesChange }) {
   const [deleting, setDeleting] = useState(null);
   const [editPage, setEditPage] = useState(null);
@@ -123,16 +139,26 @@ export default function PageGallery({ bookId, pages, onPagesChange }) {
                       </div>
 
                       {/* Bottom bar */}
-                      <div className="px-2 py-1.5 flex items-center justify-between bg-white">
-                        <span className="text-xs text-gray-500 font-medium">Pag. {index + 1}</span>
-                        <button
-                          onClick={(e) => handleDelete(e, page.id)}
-                          disabled={deleting === page.id}
-                          className="text-gray-300 hover:text-red-500 text-base leading-none"
-                          title="Elimina pagina"
-                        >
-                          {deleting === page.id ? '...' : '×'}
-                        </button>
+                      <div className="px-2 py-1.5 bg-white">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-gray-500 font-medium">Pag. {index + 1}</span>
+                          <button
+                            onClick={(e) => handleDelete(e, page.id)}
+                            disabled={deleting === page.id}
+                            className="text-gray-300 hover:text-red-500 text-base leading-none"
+                            title="Elimina pagina"
+                          >
+                            {deleting === page.id ? '...' : '×'}
+                          </button>
+                        </div>
+                        {provenanceLabel(page) && (
+                          <div
+                            className="text-[10px] text-gray-400 truncate mt-0.5"
+                            title={provenanceLabel(page)}
+                          >
+                            {provenanceLabel(page)}
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}
