@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router({ mergeParams: true });
 const path = require('path');
+const fs = require('fs');
 const db = require('../db/client');
 const { cropWithCorners, rotateInPlace, splitImage, detectCornersInImage } = require('../services/imageProcessor');
 
@@ -19,6 +20,7 @@ async function provenanceFor(bookId, sourceImage) {
   );
   const donor = rows[0]?.processing_meta || {};
   if (donor.original_filename) out.original_filename = donor.original_filename;
+  if (donor.original_upload_file) out.original_upload_file = donor.original_upload_file;
   if (donor.original_page_index != null) out.original_page_index = donor.original_page_index;
   if (out.original_page_index == null) {
     const m = path.basename(sourceImage).match(/^src_pdf_p(\d+)_/);
@@ -46,6 +48,80 @@ router.get('/by-ids', async (req, res) => {
     [req.params.bookId, ...ids]
   );
   res.json(rows);
+});
+
+// GET /api/books/:bookId/source-file?group=<group_key>
+// Resolves the original uploaded file (PDF or image) for a group of pages
+// sharing a common source. The group_key matches what SourceFilesList builds
+// on the client: original_filename when available, otherwise a derived key.
+// Returns the file inline so browser PDF/image viewers can show all pages.
+router.get('/source-file', async (req, res) => {
+  const { bookId } = req.params;
+  const group = req.query.group || req.query.name;
+  if (!group) return res.status(400).json({ error: 'group required' });
+
+  // Match by original_filename OR by source_image basename pattern (legacy).
+  const { rows } = await db.query(
+    `SELECT processing_meta, source_file, source_image
+     FROM pages
+     WHERE book_id = $1
+       AND (processing_meta->>'original_filename' = $2
+            OR source_image LIKE $3
+            OR source_file LIKE $3)
+     ORDER BY position`,
+    [bookId, group, `%${group}%`]
+  );
+  if (!rows.length) return res.status(404).json({ error: 'No pages found for that file' });
+
+  const storage = STORAGE();
+  const displayName = rows[0].processing_meta?.original_filename || group;
+
+  let rel = rows[0].processing_meta?.original_upload_file;
+
+  // Fallback 1: source_file points to a real upload (image OR pdf, not a rendered jpg).
+  if (!rel) {
+    const sf = rows[0].source_file || '';
+    if (/\.pdf$/i.test(sf) && !sf.includes('/rendered/')) rel = sf;
+    else if (/\.(jpg|jpeg|png|tiff?|bmp|webp)$/i.test(sf) && !sf.includes('/rendered/')) rel = sf;
+  }
+
+  // Fallback 2: rendered PDF page → find the source PDF in uploads/<bookId>/
+  // by matching mtime proximity (PDF written just before its rendered pages).
+  if (!rel) {
+    const sourceImage = rows[0].source_image || rows[0].source_file || '';
+    const m = path.basename(sourceImage).match(/^src_pdf_p\d+_(\d+)_/);
+    if (m) {
+      const renderTs = parseInt(m[1], 10);
+      const uploadDir = path.join(storage, 'uploads', bookId);
+      try {
+        const files = fs.readdirSync(uploadDir).filter(f => /\.pdf$/i.test(f));
+        let best = null;
+        let bestDelta = Infinity;
+        for (const f of files) {
+          const full = path.join(uploadDir, f);
+          const st = fs.statSync(full);
+          const delta = Math.abs(st.mtimeMs - renderTs);
+          if (delta < bestDelta) { bestDelta = delta; best = full; }
+        }
+        if (best) rel = path.relative(storage, best);
+      } catch (_) { /* uploads dir missing */ }
+    }
+  }
+
+  if (!rel) {
+    return res.status(404).json({
+      error: 'Original file not available — caricalo di nuovo per abilitare l\'anteprima.',
+    });
+  }
+
+  const abs = path.resolve(storage, rel);
+  if (!abs.startsWith(storage)) return res.status(400).json({ error: 'Invalid path' });
+
+  res.sendFile(abs, {
+    headers: {
+      'Content-Disposition': `inline; filename="${encodeURIComponent(displayName)}"`,
+    },
+  });
 });
 
 // PATCH /api/books/:bookId/pages/reorder

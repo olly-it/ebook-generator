@@ -67,7 +67,11 @@ async function processFiles(bookId, files, jobId) {
 
         // Track provenance: original upload filename + (for PDFs) the page index
         // encoded by Python in `src_pdf_p<N>_*.jpg`.
-        const meta = { ...(page.processing_meta || {}), original_filename: file.originalname };
+        const meta = {
+          ...(page.processing_meta || {}),
+          original_filename: file.originalname,
+          original_upload_file: path.relative(storage, file.path),
+        };
         const pdfMatch = path.basename(sourceRel).match(/^src_pdf_p(\d+)_/);
         if (pdfMatch) meta.original_page_index = parseInt(pdfMatch[1], 10);
 

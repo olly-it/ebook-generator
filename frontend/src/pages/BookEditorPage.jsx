@@ -3,8 +3,9 @@ import { useParams } from 'react-router-dom';
 import Header from '../components/layout/Header';
 import UploadZone from '../components/upload/UploadZone';
 import PageGallery from '../components/pages/PageGallery';
+import SourceFilesList from '../components/pages/SourceFilesList';
 import ExportButton from '../components/export/ExportButton';
-import { getBook, getPages, deleteAllPages } from '../api/client';
+import { getBook, getPages, deleteAllPages, renameBook } from '../api/client';
 
 export default function BookEditorPage() {
   const { bookId } = useParams();
@@ -12,6 +13,9 @@ export default function BookEditorPage() {
   const [pages, setPages] = useState([]);
   const [loading, setLoading] = useState(true);
   const [deletingAll, setDeletingAll] = useState(false);
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState('');
+  const [savingTitle, setSavingTitle] = useState(false);
 
   useEffect(() => {
     Promise.all([getBook(bookId), getPages(bookId)])
@@ -23,6 +27,29 @@ export default function BookEditorPage() {
   async function handleUploadComplete() {
     const updated = await getPages(bookId);
     setPages(updated);
+  }
+
+  function startEditTitle() {
+    setTitleDraft(book.name);
+    setEditingTitle(true);
+  }
+
+  async function commitTitle() {
+    const next = titleDraft.trim();
+    if (!next || next === book.name) {
+      setEditingTitle(false);
+      return;
+    }
+    setSavingTitle(true);
+    try {
+      const updated = await renameBook(bookId, next);
+      setBook(b => ({ ...b, name: updated.name ?? next }));
+      setEditingTitle(false);
+    } catch (e) {
+      console.error('Rename failed:', e);
+    } finally {
+      setSavingTitle(false);
+    }
   }
 
   async function handleDeleteAll() {
@@ -58,7 +85,17 @@ export default function BookEditorPage() {
 
   return (
     <>
-      <Header breadcrumb={book.name} />
+      <Header
+        breadcrumb={book.name}
+        breadcrumbEditable
+        breadcrumbEditing={editingTitle}
+        breadcrumbDraft={titleDraft}
+        breadcrumbSaving={savingTitle}
+        onBreadcrumbEdit={startEditTitle}
+        onBreadcrumbDraftChange={setTitleDraft}
+        onBreadcrumbCommit={commitTitle}
+        onBreadcrumbCancel={() => setEditingTitle(false)}
+      />
 
       <main className="max-w-7xl mx-auto px-6 py-8">
         {/* Upload */}
@@ -66,6 +103,13 @@ export default function BookEditorPage() {
           <h2 className="text-lg font-semibold text-gray-800 mb-3">Aggiungi pagine</h2>
           <UploadZone bookId={bookId} onComplete={handleUploadComplete} />
         </section>
+
+        {/* Source files */}
+        {pages.length > 0 && (
+          <section className="mb-6">
+            <SourceFilesList bookId={bookId} pages={pages} />
+          </section>
+        )}
 
         {/* Main gallery */}
         <section>
