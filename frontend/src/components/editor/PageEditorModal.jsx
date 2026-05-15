@@ -153,6 +153,9 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
   const [previewImg, setPreviewImg] = useState(null);
   const [cropKeys, setCropKeys] = useState([0, 0]);
   const [autoDetecting, setAutoDetecting] = useState(false);
+  // Per-half cropped image data URLs + bbox (source coords) used to translate
+  // corners between CropCanvas space and source-image space.
+  const [partImages, setPartImages] = useState([null, null]);
 
   // Track the split params that were in effect when corners were last initialised,
   // so we only reset corners when the user actually changes the split (not on mount).
@@ -195,6 +198,52 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
     setCropKeys(ks => ks.map(k => k + 1));
   }, [splitAt, direction]);
 
+  // Bounding box (in source image coords) used as the visible image for the
+  // CropCanvas of a given split part. Includes any existing corners so manually
+  // dragged points outside the rectangular split region remain reachable.
+  function partBBox(idx) {
+    const r = splitRegion(idx);
+    if (!r) return null;
+    let { x, y, w, h } = r;
+    const corners = parts[idx]?.corners;
+    if (corners && corners.length === 4) {
+      const xs = corners.map(c => c[0]);
+      const ys = corners.map(c => c[1]);
+      const minX = Math.min(x, ...xs);
+      const minY = Math.min(y, ...ys);
+      const maxX = Math.max(x + w, ...xs);
+      const maxY = Math.max(y + h, ...ys);
+      x = minX; y = minY; w = maxX - minX; h = maxY - minY;
+    }
+    if (previewImg) {
+      const iw = previewImg.naturalWidth;
+      const ih = previewImg.naturalHeight;
+      x = Math.max(0, x); y = Math.max(0, y);
+      w = Math.min(iw - x, w); h = Math.min(ih - y, h);
+    }
+    return { x, y, w, h };
+  }
+
+  // Render the cropped image for each split part to a data URL whenever the
+  // split parameters change. Non-split pages use the full source image.
+  useEffect(() => {
+    if (!previewImg) { setPartImages([null, null]); return; }
+    if (!doSplit) { setPartImages([null, null]); return; }
+    const next = [0, 1].map(i => {
+      const bbox = partBBox(i);
+      if (!bbox || bbox.w <= 0 || bbox.h <= 0) return null;
+      const c = document.createElement('canvas');
+      c.width = bbox.w;
+      c.height = bbox.h;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(previewImg, bbox.x, bbox.y, bbox.w, bbox.h, 0, 0, bbox.w, bbox.h);
+      return { url: c.toDataURL('image/png'), bbox };
+    });
+    setPartImages(next);
+    // Intentionally not depending on `parts` here — bbox recomputation is
+    // tied to split changes, not to live corner edits.
+  }, [previewImg, doSplit, direction, splitAt]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Compute the 4-corner rectangle for a split part (in source image coordinates)
   function splitRegion(idx) {
     if (!previewImg) return null;
@@ -224,11 +273,17 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
     return [[0, 0], [w, 0], [w, h], [0, h]];
   }
 
-  // Corners to show in CropCanvas for a given part
+  // Corners to show in CropCanvas for a given part. When the part is rendered
+  // against a cropped source image (split mode), corners are translated into
+  // the cropped image's coordinate frame so CropCanvas can position handles
+  // directly.
   function initCornersFor(idx) {
-    if (parts[idx].corners) return parts[idx].corners;
-    if (doSplit) return regionToCorners(splitRegion(idx));
-    return null; // CropCanvas defaults to 5% inset
+    const sourceCorners = parts[idx].corners || (doSplit ? regionToCorners(splitRegion(idx)) : null);
+    if (!sourceCorners) return null;
+    if (!doSplit) return sourceCorners;
+    const bbox = partImages[idx]?.bbox;
+    if (!bbox) return sourceCorners;
+    return sourceCorners.map(([x, y]) => [x - bbox.x, y - bbox.y]);
   }
 
   // Show the saved gallery thumbnail when corners + rotation + split match the
@@ -268,12 +323,20 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
   // mark the part as "manually edited" so the split-line useEffect stops
   // reprojecting its corners from the original detected quad.
   function handleUserCornersChange(idx, corners) {
+    // CropCanvas reports corners in the canvas image's coord space. For split
+    // parts the canvas image is a cropped bbox, so translate back to source
+    // coordinates before storing.
+    let sourceCorners = corners;
+    if (doSplit && partImages[idx]?.bbox) {
+      const { x: ox, y: oy } = partImages[idx].bbox;
+      sourceCorners = corners.map(([x, y]) => [x + ox, y + oy]);
+    }
     setParts(prev => {
       const cur = prev[idx];
-      if (!cornersEqual(cur.corners, corners)) {
+      if (!cornersEqual(cur.corners, sourceCorners)) {
         manualCornersRef.current[idx] = true;
       }
-      return prev.map((p, i) => i === idx ? { ...p, corners } : p);
+      return prev.map((p, i) => i === idx ? { ...p, corners: sourceCorners } : p);
     });
   }
 
@@ -362,25 +425,25 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
                 ? <SplitCanvas key={`split-${direction}`} imageUrl={sourceUrl} direction={direction} splitAt={splitAt} onSplitAtChange={setSplitAt} zoom={zoom} />
                 : <div className="flex items-center justify-center h-32 text-gray-400 text-sm">Nessun taglio — vai al passo successivo per ritagliare e ruotare</div>
             )}
-            {step === 1 && !previewImg && (
+            {step === 1 && (!previewImg || (doSplit && !partImages[0])) && (
               <div className="flex items-center justify-center h-32 text-gray-400 text-sm">Caricamento...</div>
             )}
-            {step === 1 && previewImg && (
+            {step === 1 && previewImg && (!doSplit || partImages[0]) && (
               <CropCanvas
-                key={`partA-${doSplit}-${direction}-${Math.round(splitAt * 1000)}-${cropKeys[0]}`}
-                imageUrl={sourceUrl}
+                key={`partA-${doSplit}-${direction}-${Math.round(splitAt * 1000)}-${cropKeys[0]}-${doSplit ? Math.round(partImages[0].bbox.w) + 'x' + Math.round(partImages[0].bbox.h) : 'src'}`}
+                imageUrl={doSplit ? partImages[0].url : sourceUrl}
                 initialCorners={initCornersFor(0)}
                 onCornersChange={c => handleUserCornersChange(0, c)}
                 zoom={zoom}
               />
             )}
-            {step === 2 && !previewImg && (
+            {step === 2 && (!previewImg || !partImages[1]) && (
               <div className="flex items-center justify-center h-32 text-gray-400 text-sm">Caricamento...</div>
             )}
-            {step === 2 && previewImg && (
+            {step === 2 && previewImg && partImages[1] && (
               <CropCanvas
-                key={`partB-${doSplit}-${direction}-${Math.round(splitAt * 1000)}-${cropKeys[1]}`}
-                imageUrl={sourceUrl}
+                key={`partB-${doSplit}-${direction}-${Math.round(splitAt * 1000)}-${cropKeys[1]}-${Math.round(partImages[1].bbox.w)}x${Math.round(partImages[1].bbox.h)}`}
+                imageUrl={partImages[1].url}
                 initialCorners={initCornersFor(1)}
                 onCornersChange={c => handleUserCornersChange(1, c)}
                 zoom={zoom}
