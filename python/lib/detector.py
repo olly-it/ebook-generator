@@ -13,43 +13,80 @@ def _bbox_iou(a, b):
     return inter / (aw * ah + bw * bh - inter)
 
 
+def _approx_quad(contour):
+    """Try increasing epsilons until approxPolyDP yields a convex 4-gon."""
+    peri = cv2.arcLength(contour, True)
+    for eps in (0.01, 0.015, 0.02, 0.025, 0.03, 0.04):
+        approx = cv2.approxPolyDP(contour, eps * peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            return approx
+    return None
+
+
+def _quads_from_mask(mask, min_area, max_pages):
+    """Extract up to max_pages convex 4-gon contours from a binary mask."""
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    quads, raws = [], []
+    for c in contours:
+        if cv2.contourArea(c) < min_area:
+            break
+        approx = _approx_quad(c)
+        if approx is None:
+            continue
+        if any(_bbox_iou(approx, p) > 0.3 for p in raws):
+            continue
+        quads.append(approx.reshape(4, 2).astype('float32'))
+        raws.append(approx)
+        if len(quads) >= max_pages:
+            break
+    return quads
+
+
 def find_page_contours(image, max_pages=6):
     """
     Detect rectangular page regions. Returns list of (4,2) float32 arrays
     sorted in reading order (top→bottom, left→right).
+
+    Strategy: try several thresholding approaches and merge the resulting
+    quads. This handles both scans with dark borders around light pages
+    (Otsu binary) and book covers (dark object on light background, Otsu
+    inverted), plus the legacy Canny+adaptive path as a fallback.
     """
     h, w = image.shape[:2]
-    min_area = w * h * 0.05
+    # Require quads to cover >=10% of the image — filters out spurious quads
+    # picked up on labels/stickers/inset boxes inside the page.
+    min_area = w * h * 0.10
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 11, 2)
+
+    _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, otsu_inv = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    adaptive = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY, 11, 2)
     edged = cv2.Canny(blurred, 30, 120)
     edged = cv2.dilate(edged, np.ones((3, 3), np.uint8), iterations=2)
-    combined = cv2.bitwise_or(cv2.bitwise_not(thresh), edged)
+    legacy = cv2.bitwise_or(cv2.bitwise_not(adaptive), edged)
 
-    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    # Run all three strategies; merge quads, deduping by bbox IoU.
+    merged, merged_bboxes = [], []
+    for mask in (otsu, otsu_inv, legacy):
+        for q in _quads_from_mask(mask, min_area, max_pages):
+            qi = q.astype(np.int32)
+            if any(_bbox_iou(qi, b) > 0.3 for b in merged_bboxes):
+                continue
+            merged.append(q)
+            merged_bboxes.append(qi)
 
-    quads = []
-    raw_contours = []
-    for c in contours:
-        if cv2.contourArea(c) < min_area:
-            break
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) != 4 or not cv2.isContourConvex(approx):
-            continue
-        if any(_bbox_iou(approx, prev) > 0.3 for prev in raw_contours):
-            continue
-        quads.append(approx.reshape(4, 2).astype('float32'))
-        raw_contours.append(approx)
-        if len(quads) == max_pages:
-            break
-
-    quads.sort(key=lambda q: (q[:, 1].mean(), q[:, 0].mean()))
-    return quads
+    # Prefer larger quads (more page-like) up to max_pages
+    merged.sort(key=lambda q: cv2.contourArea(q.astype(np.int32)), reverse=True)
+    merged = merged[:max_pages]
+    merged.sort(key=lambda q: (q[:, 1].mean(), q[:, 0].mean()))
+    return merged
 
 
 # ---------------------------------------------------------------------------

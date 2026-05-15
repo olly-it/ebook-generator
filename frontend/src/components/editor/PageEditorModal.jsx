@@ -5,6 +5,20 @@ import { detectCorners } from '../../api/client';
 
 const SPLIT_METHODS = new Set(['vertical_split', 'spread_split', 'no_contour_spread', 'manual_split']);
 
+function provenanceLabel(page) {
+  const meta = page.processing_meta || {};
+  let name = meta.original_filename || null;
+  let pageIdx = meta.original_page_index;
+  if (pageIdx == null && page.source_image) {
+    const m = /\/src_pdf_p(\d+)_/.exec(page.source_image);
+    if (m) pageIdx = parseInt(m[1], 10);
+  }
+  if (!name && pageIdx == null) return null;
+  if (name && pageIdx != null) return `${name} · p. ${pageIdx + 1}`;
+  if (pageIdx != null) return `p. ${pageIdx + 1}`;
+  return name;
+}
+
 function inferDirection(meta) {
   if (!meta) return 'horizontal';
   if (meta.split_direction) return meta.split_direction;
@@ -391,8 +405,13 @@ export default function PageEditorModal({ page, siblings = [], bookId, saving, o
 
         {/* Header */}
         <div className="flex items-start justify-between px-6 py-3 border-b border-gray-200 shrink-0">
-          <div>
+          <div className="min-w-0">
             <h2 className="text-base font-semibold text-gray-900">Editor pagina</h2>
+            {provenanceLabel(page) && (
+              <p className="text-xs text-gray-500 mt-0.5 truncate" title={provenanceLabel(page)}>
+                {provenanceLabel(page)}
+              </p>
+            )}
             {siblings.length > 1 && (
               <p className="text-xs text-amber-600 mt-0.5">{siblings.length} pagine da questa sorgente</p>
             )}

@@ -402,7 +402,9 @@ def main():
             small = cv2.resize(detect_img, (int(w * scale), int(h * scale))) if scale < 1 else detect_img
             quads = find_page_contours(small)
             if quads:
-                pts = (quads[0] / scale).tolist()
+                # order_points → TL, TR, BR, BL so the editor's edge handles
+                # map correctly to top/right/bottom/left.
+                pts = order_points(quads[0] / scale).tolist()
                 pts = [[x + offset_x, y + offset_y] for x, y in pts]
                 print(json.dumps({'corners': pts, 'error': None}))
             else:
